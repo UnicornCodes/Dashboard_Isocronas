@@ -407,15 +407,20 @@ def agregar_capa_municipios(mapa, gdf_mun, estado_filtro, cve_ent, variable_colo
 
 
 # ============================================
-# CARGAR DATOS
+# CARGAR DATOS — solo capas ligeras al inicio
+# Los rasters se cargan solo si el usuario los activa
 # ============================================
-data_iso, bounds_iso    = cargar_raster_isocrona()
-data_sss, bounds_sss    = cargar_raster_sss()
-lat_b, lon_l, lat_t, lon_r = bounds_iso
-stats = calcular_estadisticas(data_iso)
 gdf_pna = cargar_pna()
 gdf_entidad, gdf_edos_nofed, gdf_ro = cargar_capas_poligonos()
 edos_nofed_nombres = gdf_edos_nofed['NOMGEO'].tolist()
+
+# Valores por defecto para métricas (se actualizan si se carga isocrona)
+_stats_default = {
+    'media': 0, 'mediana': 0, 'pct_30min': 0, 'pct_1hr': 0, 'pct_2hr': 0,
+    'distribucion': [{'Rango': r, 'Emoji': e, 'Pixeles': 0, 'Porcentaje': 0}
+                     for r, e in [('< 30 min','🟢'),('30-60 min','🟡'),
+                                  ('1-2 hrs','🟠'),('2-7.5 hrs','🔴'),('> 7.5 hrs','⚫')]]
+}
 
 # ============================================
 # SIDEBAR
@@ -604,6 +609,24 @@ with st.sidebar:
 st.markdown("# 🏥 Isocronas de Accesibilidad a Centros de Salud")
 st.markdown("**Tiempo de viaje al centro de salud mas cercano en Mexico — Unidades IMSS-Bienestar**")
 
+# Cargar isocrona solo si está activa
+if mostrar_iso:
+    with st.spinner("⏳ Descargando isocrona..."):
+        data_iso, bounds_iso = cargar_raster_isocrona()
+    lat_b, lon_l, lat_t, lon_r = bounds_iso
+    stats = calcular_estadisticas(data_iso)
+else:
+    data_iso, bounds_iso = None, None
+    lat_b, lon_l, lat_t, lon_r = 14.5, -119.0, 33.0, -86.0
+    stats = _stats_default
+
+# Cargar SSS solo si está activo
+if mostrar_sss:
+    with st.spinner("⏳ Descargando HeatMap SSS..."):
+        data_sss, bounds_sss = cargar_raster_sss()
+else:
+    data_sss, bounds_sss = None, None
+
 c1,c2,c3,c4,c5 = st.columns(5)
 c1.metric("⏱️ Tiempo promedio", f"{stats['media']:.0f} min",   f"~{stats['media']/60:.1f} hrs",   delta_color="off")
 c2.metric("⏱️ Tiempo mediano",  f"{stats['mediana']:.0f} min", f"~{stats['mediana']/60:.1f} hrs", delta_color="off")
@@ -624,7 +647,7 @@ st.markdown("---")
 m = folium.Map(location=[23.6,-102.5], zoom_start=5, tiles=basemap)
 
 # Raster isocronas
-if mostrar_iso:
+if mostrar_iso and data_iso is not None:
     img_iso = crear_imagen_raster(data_iso, tuple(RANGOS_ISOCRONA), tuple(colores_iso))
     folium.raster_layers.ImageOverlay(
         image=img_iso,
@@ -633,8 +656,8 @@ if mostrar_iso:
     ).add_to(m)
 
 # Raster HeatMap SSS
-if mostrar_sss:
-    b_sss = bounds_sss  # (bottom, left, top, right)
+if mostrar_sss and data_sss is not None:
+    b_sss = bounds_sss
     img_sss = crear_imagen_raster(data_sss, tuple(RANGOS_SSS), tuple(colores_sss))
     folium.raster_layers.ImageOverlay(
         image=img_sss,
