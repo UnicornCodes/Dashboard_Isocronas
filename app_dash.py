@@ -42,10 +42,10 @@ ESQUEMAS_ISOCRONA = {
 }
 
 RANGOS_ISOCRONA  = [(0.01,30),(30,60),(60,120),(120,450),(450,50000)]
-RANGOS_HOSP      = [(0.01,30),(30,60),(60,120),(120,99999)]
+RANGOS_HOSP      = [(0.01,30),(30,60),(60,120),(120,450),(450,99999)]
 
-ESQUEMA_SEMAFORO = {'colores': ['#2ecc71','#f39c12','#e67e22','#e74c3c'], 'labels': ['< 30 min','30-60 min','1-2 hrs','> 2 hrs']}
-ESQUEMA_AZULES   = {'colores': ['#aed6f1','#5dade2','#2e86c1','#1a5276'],  'labels': ['< 30 min','30-60 min','1-2 hrs','> 2 hrs']}
+ESQUEMA_SEMAFORO = {'colores': ['#2ecc71','#f39c12','#e67e22','#e74c3c','#7b0c0c'], 'labels': ['< 30 min','30-60 min','1-2 hrs','2-7.5 hrs','> 7.5 hrs']}
+ESQUEMA_AZULES   = {'colores': ['#d4e6f1','#a2cce3','#5faed1','#2980b9','#1a5276'],  'labels': ['< 30 min','30-60 min','1-2 hrs','2-7.5 hrs','> 7.5 hrs']}
 
 RANGOS_SSS  = [(1,100),(100,500),(500,3000),(3000,15000),(15000,50000),(50000,300001)]
 ESQUEMAS_SSS = {
@@ -125,47 +125,49 @@ def cargar_raster_sss():
 def cargar_raster_hospital(nombre):
     if nombre in _cache: return _cache[nombre]
     ruta = obtener_ruta_archivo(nombre)
-    with rasterio.open(ruta) as src:
-        src_crs   = src.crs
-        src_nodata = src.nodata
-        necesita_reproyectar = src_crs and src_crs.to_epsg() != 4326
 
-        if necesita_reproyectar:
-            transform, width, height = calculate_default_transform(
-                src_crs, 'EPSG:4326',
-                src.width // 4, src.height // 4,
-                *src.bounds)
-            data = np.full((height, width), np.nan, dtype=float)
-            reproject(
-                source=rasterio.band(src, 1),
-                destination=data,
-                src_transform=src.transform,
-                src_crs=src_crs,
-                dst_transform=transform,
-                dst_crs='EPSG:4326',
-                resampling=Resampling.average,
-                src_nodata=src_nodata,
-                dst_nodata=np.nan,
-            )
-            # array_bounds → (left, bottom, right, top) = (west, south, east, north)
-            left, bottom, right, top = array_bounds(height, width, transform)
-            bounds = (bottom, left, top, right)   # folium: (south, west, north, east)
-        else:
-            data = src.read(1, out_shape=(src.height // 4, src.width // 4),
-                            resampling=Resampling.average).astype(float)
-            b = src.bounds
-            bounds = (b.bottom, b.left, b.top, b.right)
-            if src_nodata is not None:
-                data[data == src_nodata] = np.nan
+    # Cargar isocrona primero para usar su grid como referencia
+    iso_ruta = obtener_ruta_archivo("AC_PN_NUMM_4326.tif")
+    with rasterio.open(iso_ruta) as iso:
+        iso_transform = iso.transform
+        iso_w = iso.width  // 4
+        iso_h = iso.height // 4
+        iso_bounds = iso.bounds
+        # Recalcular transform para la resolución reducida
+        from rasterio.transform import from_bounds
+        dst_transform = from_bounds(
+            iso_bounds.left, iso_bounds.bottom,
+            iso_bounds.right, iso_bounds.top,
+            iso_w, iso_h)
+
+    with rasterio.open(ruta) as src:
+        src_nodata = src.nodata
+        data = np.full((iso_h, iso_w), np.nan, dtype=float)
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=data,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=dst_transform,
+            dst_crs='EPSG:4326',
+            resampling=Resampling.average,
+            src_nodata=src_nodata,
+            dst_nodata=np.nan,
+        )
+
+    # Usar exactamente los mismos bounds que la isocrona
+    bounds = (iso_bounds.bottom, iso_bounds.left, iso_bounds.top, iso_bounds.right)
 
     data[data == -9999] = np.nan
     data[data >= 1e+30] = np.nan
     data[data <= 0]     = np.nan
 
     # Convertir segundos → minutos
+    # Si mediana < 30 y max > 300 → valores en segundos
     validos = data[~np.isnan(data)]
-    if len(validos) > 0 and np.nanmax(validos) > 1440:
-        data = data / 60.0
+    if len(validos) > 0:
+        if np.nanmedian(validos) < 30 and np.nanmax(validos) > 300:
+            data = data / 60.0
 
     _cache[nombre] = (data, bounds)
 
@@ -173,7 +175,7 @@ def cargar_raster_hospital(nombre):
     validos2 = data[~np.isnan(data)]
     print(f"[{nombre}] bounds={bounds}")
     print(f"[{nombre}] min={np.nanmin(validos2):.1f} max={np.nanmax(validos2):.1f} media={np.nanmean(validos2):.1f} mediana={np.nanmedian(validos2):.1f}")
-    for umbral in [30, 60, 120, 240, 480]:
+    for umbral in [5, 15, 30, 60]:
         pct = np.sum(validos2 < umbral) / len(validos2) * 100
         print(f"  < {umbral} min: {pct:.1f}%")
 
@@ -223,39 +225,39 @@ def cargar_agebs():
 
 
 def tabla_pob_por_categoria(gdf, col_cat, col_pob, titulo, color_accent):
-    """Genera tabla HTML de población total por categoría de tiempo"""
-    COLORES_CAT_TIEMPO = {
-        '0 a 30 min':   '#2ecc71',
-        '30.1 a 60':    '#f39c12',
-        '60.1 a 120':   '#e67e22',
-        '>120 min':     '#e74c3c',
-    }
+    """Genera tabla de población por categoría, ordenada numéricamente ascendente"""
+    import re
+
+    PALETA = ['#2ecc71', '#f39c12', '#e67e22', '#e74c3c', '#7b0c0c']
+
     if col_cat not in gdf.columns or col_pob not in gdf.columns:
-        return html.P(f"Columna {col_cat} o {col_pob} no encontrada.",
+        return html.P(f"Columna {col_cat} no encontrada.",
                       style={"color":"#555","fontSize":"11px","fontFamily":"DM Mono"})
 
     resumen = (gdf.groupby(col_cat)[col_pob]
                .sum().reset_index()
                .rename(columns={col_cat:'Categoría', col_pob:'Población'}))
-    total   = resumen['Población'].sum()
+    total = resumen['Población'].sum()
     resumen['%'] = resumen['Población'] / total * 100 if total > 0 else 0
 
-    # Orden fijo de categorías
-    orden = ['0 a 30 min','30.1 a 60','60.1 a 120','>120 min']
-    resumen['_ord'] = resumen['Categoría'].map({c:i for i,c in enumerate(orden)}).fillna(99)
-    resumen = resumen.sort_values('_ord').drop(columns='_ord')
+    # Extraer primer número de la categoría para ordenar numéricamente
+    def primer_numero(s):
+        m = re.search(r'[\d.]+', str(s))
+        return float(m.group()) if m else 9999
+
+    resumen['_ord'] = resumen['Categoría'].apply(primer_numero)
+    resumen = resumen.sort_values('_ord').reset_index(drop=True)
 
     filas = []
-    for _, row in resumen.iterrows():
-        c = COLORES_CAT_TIEMPO.get(str(row['Categoría']).strip(), '#aaa')
+    for i, row in resumen.iterrows():
+        c = PALETA[min(i, len(PALETA) - 1)]
         filas.append(html.Tr([
             html.Td([
                 html.Span(style={"display":"inline-block","width":"8px","height":"8px",
                                  "borderRadius":"50%","backgroundColor":c,
-                                 "marginRight":"6px","flexShrink":"0"}),
+                                 "marginRight":"6px","flexShrink":"0","verticalAlign":"middle"}),
                 str(row['Categoría'])
-            ], style={"fontSize":"11px","color":"#c8d0e7","padding":"5px 8px",
-                      "fontFamily":"DM Mono","display":"flex","alignItems":"center"}),
+            ], style={"fontSize":"11px","color":"#c8d0e7","padding":"5px 8px","fontFamily":"DM Mono"}),
             html.Td(f"{int(row['Población']):,}",
                     style={"fontSize":"11px","color":"#9ba8c0","padding":"5px 8px",
                            "textAlign":"right","fontFamily":"DM Mono"}),
@@ -265,13 +267,13 @@ def tabla_pob_por_categoria(gdf, col_cat, col_pob, titulo, color_accent):
         ], style={"borderBottom":"1px solid #1a2035"}))
 
     return html.Div([
-        html.P(titulo, style={"color": color_accent,"fontSize":"12px","fontWeight":"600",
+        html.P(titulo, style={"color":color_accent,"fontSize":"12px","fontWeight":"600",
                               "fontFamily":"Syne","marginBottom":"6px"}),
         html.Table([
             html.Thead(html.Tr([
-                html.Th("Categoría",  style={"color":"#3d4f6e","fontSize":"10px","padding":"4px 8px","fontFamily":"DM Mono","fontWeight":"500","borderBottom":"1px solid #1e2438"}),
-                html.Th("Población",  style={"color":"#3d4f6e","fontSize":"10px","padding":"4px 8px","textAlign":"right","fontFamily":"DM Mono","fontWeight":"500","borderBottom":"1px solid #1e2438"}),
-                html.Th("%",          style={"color":"#3d4f6e","fontSize":"10px","padding":"4px 8px","textAlign":"right","fontFamily":"DM Mono","fontWeight":"500","borderBottom":"1px solid #1e2438"}),
+                html.Th("Categoría", style={"color":"#3d4f6e","fontSize":"10px","padding":"4px 8px","fontFamily":"DM Mono","fontWeight":"500","borderBottom":"1px solid #1e2438"}),
+                html.Th("Población", style={"color":"#3d4f6e","fontSize":"10px","padding":"4px 8px","textAlign":"right","fontFamily":"DM Mono","fontWeight":"500","borderBottom":"1px solid #1e2438"}),
+                html.Th("%",         style={"color":"#3d4f6e","fontSize":"10px","padding":"4px 8px","textAlign":"right","fontFamily":"DM Mono","fontWeight":"500","borderBottom":"1px solid #1e2438"}),
             ])),
             html.Tbody(filas),
             html.Tfoot(html.Tr([
@@ -798,7 +800,21 @@ content = html.Div([
             "fontSize":"16px","marginBottom":"4px"
         }),
         html.P("Totales de población según tiempo de viaje al centro de salud más cercano — fuente: AGEBs",
-               style={"color":"#6b7a99","fontSize":"12px","fontFamily":"DM Mono","marginBottom":"16px"}),
+               style={"color":"#6b7a99","fontSize":"12px","fontFamily":"DM Mono","marginBottom":"12px"}),
+        dbc.Row([
+            dbc.Col([
+                html.Label("Filtrar por estado:", style={"color":"#9ba8c0","fontSize":"11px","fontFamily":"DM Mono","marginBottom":"4px"}),
+                dcc.Dropdown(
+                    id="filtro-estado-tablas",
+                    options=[{"label": e, "value": e} for e in sorted(estados_lista[1:])],
+                    value=None,
+                    placeholder="Todos los estados...",
+                    multi=True,
+                    clearable=True,
+                    style={"fontSize":"12px"},
+                ),
+            ], width=6),
+        ], className="mb-3"),
         dbc.Row([
             dbc.Col(html.Div(id="tabla-pob-pna"),   width=4),
             dbc.Col(html.Div(id="tabla-pob-camas"),  width=4),
@@ -869,6 +885,7 @@ app.layout = html.Div([sidebar, content], style={"backgroundColor":"#0f1117","mi
     Input("filtro-ent",     "value"),
     Input("filtro-cat",     "value"),
     Input("basemap",        "value"),
+    Input("filtro-estado-tablas", "value"),
 )
 def actualizar_mapa(
     iso_on, iso_op, iso_esq,
@@ -877,7 +894,7 @@ def actualizar_mapa(
     camas_on, camas_op, camas_esq,
     estados_on, ro_on, estado_mun, var_mun,
     pna_on, cluster, filtro_ent, filtro_cat,
-    basemap
+    basemap, filtro_estado_tablas
 ):
     status = ""
     capas = {
@@ -1007,15 +1024,34 @@ def actualizar_mapa(
     # ---- Tablitas de población por categoría (AGEBs) ----
     try:
         gdf_ageb = cargar_agebs()
-        # Detectar columna de población automáticamente
         col_pob_candidates = [c for c in gdf_ageb.columns
                               if any(k in c.upper() for k in ['POB','TOTAL','HAB'])]
         col_pob = col_pob_candidates[0] if col_pob_candidates else None
 
+        # Filtrar por estado si se seleccionó
+        gdf_f = gdf_ageb.copy()
+        if filtro_estado_tablas:
+            # Buscar columna de estado/entidad en el ageb
+            col_ent_ageb = next((c for c in gdf_f.columns
+                                 if any(k in c.upper() for k in ['ENTIDAD','NOMGEO','NOM_ENT','ESTADO'])), None)
+            if col_ent_ageb:
+                gdf_f = gdf_f[gdf_f[col_ent_ageb].isin(filtro_estado_tablas)]
+            else:
+                # Intentar por CVE_ENT si hay columna de clave
+                col_cve = next((c for c in gdf_f.columns if 'CVE_ENT' in c.upper()), None)
+                if col_cve:
+                    # Mapear nombre→clave usando gdf_entidad_g
+                    claves = gdf_entidad_g[gdf_entidad_g['NOMGEO'].isin(filtro_estado_tablas)]['CVE_ENT'].tolist() \
+                             if 'CVE_ENT' in gdf_entidad_g.columns else []
+                    if claves:
+                        gdf_f = gdf_f[gdf_f[col_cve].isin(claves)]
+
+        estado_label = f" — {', '.join(filtro_estado_tablas)}" if filtro_estado_tablas else ""
+
         if col_pob:
-            tab_pna   = tabla_pob_por_categoria(gdf_ageb, 'cat_PNA',   col_pob, "📍 PNA · Centros de salud", "#7eb8f7")
-            tab_camas = tabla_pob_por_categoria(gdf_ageb, 'cat_camas', col_pob, "🛏️ H. no especializados",   "#a29bfe")
-            tab_sna   = tabla_pob_por_categoria(gdf_ageb, 'cat_sna',   col_pob, "🏥 Todos los hospitales",   "#55efc4")
+            tab_pna   = tabla_pob_por_categoria(gdf_f, 'cat_PNA',   col_pob, f"📍 PNA · Centros de salud{estado_label}",  "#7eb8f7")
+            tab_camas = tabla_pob_por_categoria(gdf_f, 'cat_camas', col_pob, f"🛏️ H. no especializados{estado_label}",    "#a29bfe")
+            tab_sna   = tabla_pob_por_categoria(gdf_f, 'cat_sna',   col_pob, f"🏥 Todos los hospitales{estado_label}",    "#55efc4")
         else:
             msg = html.P("Columna de población no encontrada.", style={"color":"#555","fontSize":"11px"})
             tab_pna = tab_camas = tab_sna = msg
