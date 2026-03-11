@@ -42,10 +42,10 @@ ESQUEMAS_ISOCRONA = {
 }
 
 RANGOS_ISOCRONA  = [(0.01,30),(30,60),(60,120),(120,450),(450,50000)]
-RANGOS_HOSP      = [(0.01,30),(30,60),(60,99999)]
+RANGOS_HOSP      = [(0.01,30),(30,60),(60,120),(120,99999)]
 
-ESQUEMA_SEMAFORO = {'colores': ['#2ecc71','#f39c12','#e74c3c'], 'labels': ['< 30 min','30-60 min','> 60 min']}
-ESQUEMA_AZULES   = {'colores': ['#5dade2','#2e86c1','#1a5276'], 'labels': ['< 30 min','30-60 min','> 60 min']}
+ESQUEMA_SEMAFORO = {'colores': ['#2ecc71','#f39c12','#e67e22','#e74c3c'], 'labels': ['< 30 min','30-60 min','1-2 hrs','> 2 hrs']}
+ESQUEMA_AZULES   = {'colores': ['#aed6f1','#5dade2','#2e86c1','#1a5276'],  'labels': ['< 30 min','30-60 min','1-2 hrs','> 2 hrs']}
 
 RANGOS_SSS  = [(1,100),(100,500),(500,3000),(3000,15000),(15000,50000),(50000,300001)]
 ESQUEMAS_SSS = {
@@ -126,24 +126,53 @@ def cargar_raster_hospital(nombre):
     if nombre in _cache: return _cache[nombre]
     ruta = obtener_ruta_archivo(nombre)
     with rasterio.open(ruta) as src:
-        if src.crs and src.crs.to_epsg() != 4326:
+        src_crs = src.crs
+        necesita_reproyectar = src_crs and src_crs.to_epsg() != 4326
+
+        if necesita_reproyectar:
             transform, width, height = calculate_default_transform(
-                src.crs, 'EPSG:4326', src.width//4, src.height//4, *src.bounds)
-            data = np.empty((height, width), dtype=float)
-            reproject(source=rasterio.band(src, 1), destination=data,
-                      src_transform=src.transform, src_crs=src.crs,
-                      dst_transform=transform, dst_crs='EPSG:4326',
-                      resampling=Resampling.average)
-            left_b, bottom_b, right_b, top_b = array_bounds(height, width, transform)
-            bounds = (bottom_b, left_b, top_b, right_b)
+                src_crs, 'EPSG:4326',
+                src.width // 4, src.height // 4,
+                *src.bounds)
+            data = np.full((height, width), np.nan, dtype=float)
+            reproject(
+                source=rasterio.band(src, 1),
+                destination=data,
+                src_transform=src.transform,
+                src_crs=src_crs,
+                dst_transform=transform,
+                dst_crs='EPSG:4326',
+                resampling=Resampling.average,
+                src_nodata=src.nodata,
+                dst_nodata=np.nan,
+            )
+            # array_bounds devuelve (west, south, east, north) → convertir a (south, west, north, east)
+            west, south, east, north = rasterio.transform.array_bounds(height, width, transform)
+            bounds = (south, west, north, east)
         else:
-            data = src.read(1, out_shape=(src.height//4, src.width//4),
+            data = src.read(1, out_shape=(src.height // 4, src.width // 4),
                             resampling=Resampling.average).astype(float)
-            bounds = (src.bounds.bottom, src.bounds.left, src.bounds.top, src.bounds.right)
-            if src.nodata: data[data == src.nodata] = np.nan
-    data[data==-9999]=np.nan; data[data>=1e+30]=np.nan; data[data<=0]=np.nan
-    if np.nanmax(data[~np.isnan(data)]) > 1440:
+            b = src.bounds
+            bounds = (b.bottom, b.left, b.top, b.right)
+            if src.nodata is not None:
+                data[data == src.nodata] = np.nan
+
+    data[data == -9999] = np.nan
+    data[data >= 1e+30] = np.nan
+    data[data <= 0]     = np.nan
+
+    # Convertir segundos → minutos si los valores son claramente segundos
+    validos = data[~np.isnan(data)]
+    if len(validos) > 0 and np.nanmax(validos) > 1440:
         data = data / 60.0
+
+    # Recortar bounds a territorio de México como sanity check
+    south = max(bounds[0], 14.5)
+    west  = max(bounds[1], -118.5)
+    north = min(bounds[2], 32.8)
+    east  = min(bounds[3], -86.5)
+    bounds = (south, west, north, east)
+
     _cache[nombre] = (data, bounds)
     return data, bounds
 
