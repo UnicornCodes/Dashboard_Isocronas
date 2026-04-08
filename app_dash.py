@@ -16,6 +16,21 @@ import os
 import tempfile
 import requests
 
+# Directorio base = carpeta donde está este script
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def ruta(nombre):
+    """Retorna ruta absoluta a un archivo en la carpeta del proyecto."""
+    return os.path.join(BASE_DIR, nombre)
+
+# ── Diagnóstico al inicio ─────────────────────────────────────────────────────
+print(f"\n{'='*50}")
+print(f"BASE_DIR: {BASE_DIR}")
+for f in ["AC_PN_NUMM_fix.tif", "AC_PN_NUMM_4326.tif", "Distanc_SNA_fix.tif", "DA_CAMAS_fix.tif", "HeatMap_sss_fix.tif"]:
+    existe = os.path.exists(ruta(f))
+    print(f"  {'✅' if existe else '❌'} {f}")
+print(f"{'='*50}\n")
+
 # ============================================
 # CONSTANTES
 # ============================================
@@ -86,23 +101,46 @@ def obtener_ruta_archivo(nombre):
     return tmp_path
 
 
+def _bounds_from_gpkg():
+    if 'mexico_bounds' in _cache:
+        return _cache['mexico_bounds']
+    fix = ruta("AC_PN_NUMM_fix.tif")
+    if os.path.exists(fix):
+        with rasterio.open(fix) as src:
+            b = src.bounds
+            bounds = (b.bottom, b.left, b.top, b.right)
+    else:
+        bounds = (14.5340, -117.1274, 32.7240, -86.7174)
+    _cache['mexico_bounds'] = bounds
+    return bounds
+
+
 def cargar_raster_isocrona():
     if 'iso' in _cache: return _cache['iso']
-    ruta = obtener_ruta_archivo("AC_PN_NUMM_4326.tif")
-    with rasterio.open(ruta) as src:
+    src_path = ruta("AC_PN_NUMM_fix.tif")
+    if not os.path.exists(src_path):
+        src_path = obtener_ruta_archivo("AC_PN_NUMM_4326.tif")
+    print(f"  Cargando isocrona: {src_path}")
+    with rasterio.open(src_path) as src:
         data = src.read(1, out_shape=(src.height//4, src.width//4),
                         resampling=rasterio.enums.Resampling.average).astype(float)
-        bounds = (src.bounds.bottom, src.bounds.left, src.bounds.top, src.bounds.right)
-        if src.nodata: data[data == src.nodata] = np.nan
-    data[data==-9999]=np.nan; data[data>=1e+30]=np.nan; data[data==0]=np.nan
+        b = src.bounds
+        bounds = (b.bottom, b.left, b.top, b.right)  # (S, W, N, E)
+        if src.nodata is not None:
+            data[data == src.nodata] = np.nan
+    data[data <= 0] = np.nan
+    data[data >= 1e30] = np.nan
+    print(f"  bounds={bounds}  shape={data.shape}  med={np.nanmedian(data[~np.isnan(data)]):.1f}")
     _cache['iso'] = (data, bounds)
     return data, bounds
 
 
 def cargar_raster_sss():
     if 'sss' in _cache: return _cache['sss']
-    ruta = obtener_ruta_archivo("HeatMap_sss.tif")
-    with rasterio.open(ruta) as src:
+    archivo = "HeatMap_sss_fix.tif" if os.path.exists(ruta("HeatMap_sss_fix.tif")) else "HeatMap_sss.tif"
+    print(f"  Cargando SSS: {archivo}")
+    src_path = ruta(archivo) if os.path.exists(ruta(archivo)) else obtener_ruta_archivo("HeatMap_sss.tif")
+    with rasterio.open(src_path) as src:
         if src.crs and src.crs.to_epsg() != 4326:
             transform, width, height = calculate_default_transform(
                 src.crs, 'EPSG:4326', src.width//4, src.height//4, *src.bounds)
@@ -116,7 +154,8 @@ def cargar_raster_sss():
         else:
             data = src.read(1, out_shape=(src.height//4, src.width//4),
                             resampling=rasterio.enums.Resampling.average).astype(float)
-            bounds = (src.bounds.bottom, src.bounds.left, src.bounds.top, src.bounds.right)
+            b = src.bounds
+            bounds = (b.bottom, b.left, b.top, b.right)
     data[data==-9999]=np.nan; data[data>=1e+30]=np.nan; data[data<=0]=np.nan
     _cache['sss'] = (data, bounds)
     return data, bounds
@@ -124,61 +163,49 @@ def cargar_raster_sss():
 
 def cargar_raster_hospital(nombre):
     if nombre in _cache: return _cache[nombre]
-    ruta = obtener_ruta_archivo(nombre)
 
-    # Cargar isocrona primero para usar su grid como referencia
-    iso_ruta = obtener_ruta_archivo("AC_PN_NUMM_4326.tif")
-    with rasterio.open(iso_ruta) as iso:
-        iso_transform = iso.transform
-        iso_w = iso.width  // 4
-        iso_h = iso.height // 4
-        iso_bounds = iso.bounds
-        # Recalcular transform para la resolución reducida
-        from rasterio.transform import from_bounds
-        dst_transform = from_bounds(
-            iso_bounds.left, iso_bounds.bottom,
-            iso_bounds.right, iso_bounds.top,
-            iso_w, iso_h)
+    nombre_fix = nombre.replace(".tif", "_fix.tif")
+    ruta_fix = ruta(nombre_fix)
+    ruta_orig = ruta(nombre) if os.path.exists(ruta(nombre)) else obtener_ruta_archivo(nombre)
+    src_path = ruta_fix if os.path.exists(ruta_fix) else ruta_orig
+    print(f"  Cargando {nombre}: {src_path}")
 
-    with rasterio.open(ruta) as src:
-        src_nodata = src.nodata
-        data = np.full((iso_h, iso_w), np.nan, dtype=float)
-        reproject(
-            source=rasterio.band(src, 1),
-            destination=data,
-            src_transform=src.transform,
-            src_crs=src.crs,
-            dst_transform=dst_transform,
-            dst_crs='EPSG:4326',
-            resampling=Resampling.average,
-            src_nodata=src_nodata,
-            dst_nodata=np.nan,
-        )
-
-    # Usar exactamente los mismos bounds que la isocrona
-    bounds = (iso_bounds.bottom, iso_bounds.left, iso_bounds.top, iso_bounds.right)
+    with rasterio.open(src_path) as src:
+        if src.crs and src.crs.to_epsg() == 4326:
+            # _fix ya está en 4326 — leer directo
+            data = src.read(1, out_shape=(src.height//4, src.width//4),
+                            resampling=Resampling.average).astype(float)
+            b = src.bounds
+            bounds = (b.bottom, b.left, b.top, b.right)
+        else:
+            # reproyectar al grid de la isocrona
+            _, iso_bounds = cargar_raster_isocrona()
+            S, W, N, E = iso_bounds
+            from rasterio.transform import from_bounds as fb
+            DST_W, DST_H = 6375//4, 3815//4
+            dst_t = fb(W, S, E, N, DST_W, DST_H)
+            crs_src = src.crs or rasterio.crs.CRS.from_epsg(6370)
+            data = np.full((DST_H, DST_W), np.nan, dtype=float)
+            reproject(source=rasterio.band(src, 1), destination=data,
+                      src_transform=src.transform, src_crs=crs_src,
+                      dst_transform=dst_t, dst_crs='EPSG:4326',
+                      resampling=Resampling.average,
+                      src_nodata=src.nodata, dst_nodata=np.nan)
+            bounds = (S, W, N, E)
 
     data[data == -9999] = np.nan
-    data[data >= 1e+30] = np.nan
+    data[data >= 1e30]  = np.nan
     data[data <= 0]     = np.nan
 
-    # Convertir segundos → minutos
-    # Si mediana < 30 y max > 300 → valores en segundos
-    validos = data[~np.isnan(data)]
-    if len(validos) > 0:
-        if np.nanmedian(validos) < 30 and np.nanmax(validos) > 300:
-            data = data / 60.0
+    v = data[~np.isnan(data)]
+    if len(v) > 0 and np.nanmedian(v) < 30 and np.nanmax(v) > 300:
+        print(f"  Convirtiendo s->min")
+        data = data / 60.0
 
+    v = data[~np.isnan(data)]
+    if len(v) > 0:
+        print(f"  OK {len(v):,} px  med={np.nanmedian(v):.1f} min")
     _cache[nombre] = (data, bounds)
-
-    # Diagnóstico (quitar después)
-    validos2 = data[~np.isnan(data)]
-    print(f"[{nombre}] bounds={bounds}")
-    print(f"[{nombre}] min={np.nanmin(validos2):.1f} max={np.nanmax(validos2):.1f} media={np.nanmean(validos2):.1f} mediana={np.nanmedian(validos2):.1f}")
-    for umbral in [5, 15, 30, 60]:
-        pct = np.sum(validos2 < umbral) / len(validos2) * 100
-        print(f"  < {umbral} min: {pct:.1f}%")
-
     return data, bounds
 
 
@@ -217,9 +244,39 @@ def cargar_municipios():
 
 
 def cargar_agebs():
-    """Carga anexo1 con tiempos a los 3 rasters y población por AGEB"""
+    """Carga anexo1 con tiempos a los 3 rasters y población por AGEB.
+    Hace join con MUNICIPAL_CARACTERISTICAS para agregar Grado de Marginación."""
     if 'agebs' in _cache: return _cache['agebs']
     gdf = gpd.read_file("anexo1_desde_excel_tiempos.gpkg")
+
+    # Join con municipios para obtener grado de marginación
+    try:
+        gdf_mun = gpd.read_file("MUNICIPAL_CARACTERISTICAS.gpkg")
+        # Asegurar clave de join compatible
+        if 'CVEGEO' in gdf_mun.columns:
+            gdf_mun['CVEGEO_MUN'] = gdf_mun['CVEGEO'].astype(str).str.zfill(5)
+        elif 'clmun' in gdf_mun.columns:
+            gdf_mun['CVEGEO_MUN'] = gdf_mun['clmun'].astype(str).str.zfill(5)
+
+        gdf['CVEGEO_MUN'] = gdf['CVEGEO_MUN'].astype(str).str.zfill(5)
+
+        # Seleccionar solo columna de GM para el join
+        col_gm = None
+        for c in ['gm', 'GM', 'grado_marginacion']:
+            if c in gdf_mun.columns:
+                col_gm = c
+                break
+
+        if col_gm and 'CVEGEO_MUN' in gdf_mun.columns:
+            mun_gm = gdf_mun[['CVEGEO_MUN', col_gm]].drop_duplicates('CVEGEO_MUN')
+            gdf = gdf.merge(mun_gm, on='CVEGEO_MUN', how='left')
+            gdf = gdf.rename(columns={col_gm: 'gm'})
+            print(f"  AGEBs: join grado marginación OK — valores únicos: {gdf['gm'].dropna().unique()[:6]}")
+        else:
+            print("  AGEBs: columna GM no encontrada en MUNICIPAL_CARACTERISTICAS")
+    except Exception as e:
+        print(f"  AGEBs: no se pudo hacer join con municipios: {e}")
+
     _cache['agebs'] = gdf
     return gdf
 
@@ -287,7 +344,10 @@ def tabla_pob_por_categoria(gdf, col_cat, col_pob, titulo, color_accent):
               "border":"1px solid #1e2438"})
 
 
-def crear_imagen_raster(data, rangos, colores):
+def crear_imagen_raster(data, rangos, colores, aplicar_mercator=False, lat_s=14.5321, lat_n=32.7187):
+    """Convierte array numpy a PNG base64. Si aplicar_mercator=True, estira verticalmente
+    para compensar la distorsión de Web Mercator (Leaflet)."""
+    import math
     h, w = data.shape
     colored = np.zeros((h, w, 4), dtype=np.uint8)
     for i, (vmin, vmax) in enumerate(rangos):
@@ -296,6 +356,25 @@ def crear_imagen_raster(data, rangos, colores):
         r, g, b = int(hx[0:2],16), int(hx[2:4],16), int(hx[4:6],16)
         colored[mask] = [r, g, b, 210]
     colored[np.isnan(data)] = [0,0,0,0]
+
+    if aplicar_mercator:
+        # Reproyectar filas de WGS84 a Web Mercator
+        def merc(lat):
+            return math.log(math.tan(math.pi/4 + math.radians(lat)/2))
+        merc_s = merc(lat_s)
+        merc_n = merc(lat_n)
+        # Para cada fila de salida, calcular de qué fila de entrada viene
+        new_rows = np.zeros(h, dtype=int)
+        for row_out in range(h):
+            # fila 0 = norte, fila h-1 = sur
+            frac = row_out / (h - 1)  # 0=norte, 1=sur
+            lat_merc = merc_n - frac * (merc_n - merc_s)
+            lat_deg = math.degrees(2 * math.atan(math.exp(lat_merc)) - math.pi/2)
+            # Convertir lat_deg a fila en el array WGS84
+            row_in = int((lat_n - lat_deg) / (lat_n - lat_s) * (h - 1))
+            new_rows[row_out] = max(0, min(h-1, row_in))
+        colored = colored[new_rows, :, :]
+
     img = Image.fromarray(colored, mode='RGBA')
     buf = io.BytesIO()
     img.save(buf, format='PNG')
@@ -331,66 +410,90 @@ def construir_mapa(capas):
     basemap  = capas.get('basemap', 'CartoDB positron')
     m = folium.Map(location=[23.6, -102.5], zoom_start=5, tiles=basemap)
 
-    # Isocronas
+    # Bounds exactos desde el raster fix
+    MEX_S, MEX_W, MEX_N, MEX_E = _bounds_from_gpkg()
+
+    # ── Rasters (van primero, debajo de todo) ─────────────────────────────────
     if capas.get('iso_on') and capas.get('iso_data') is not None:
-        data, bounds = capas['iso_data']
+        data, _ = capas['iso_data']
         esquema = ESQUEMAS_ISOCRONA.get(capas.get('iso_esquema','Azules'))
-        img = crear_imagen_raster(data, RANGOS_ISOCRONA, esquema['colores'])
-        lat_b, lon_l, lat_t, lon_r = bounds
+        img = crear_imagen_raster(data, RANGOS_ISOCRONA, esquema['colores'],
+                                  aplicar_mercator=True, lat_s=MEX_S, lat_n=MEX_N)
         folium.raster_layers.ImageOverlay(
-            image=img, bounds=[[lat_b-0.2,lon_l],[lat_t-0.2,lon_r]],
-            opacity=capas.get('iso_opacity',0.8), name="⏱️ Isocronas"
+            image=img, bounds=[[MEX_S, MEX_W], [MEX_N, MEX_E]],
+            opacity=capas.get('iso_opacity', 0.8), name="⏱️ Isocronas"
         ).add_to(m)
 
-    # HeatMap SSS
     if capas.get('sss_on') and capas.get('sss_data') is not None:
-        data, bounds = capas['sss_data']
+        data, _ = capas['sss_data']
         esquema = ESQUEMAS_SSS.get(capas.get('sss_esquema','Calor'))
-        img = crear_imagen_raster(data, RANGOS_SSS, esquema['colores'])
+        img = crear_imagen_raster(data, RANGOS_SSS, esquema['colores'],
+                                  aplicar_mercator=True, lat_s=MEX_S, lat_n=MEX_N)
         folium.raster_layers.ImageOverlay(
-            image=img, bounds=[[bounds[0],bounds[1]],[bounds[2],bounds[3]]],
-            opacity=capas.get('sss_opacity',0.75), name="👥 HeatMap SSS"
+            image=img, bounds=[[MEX_S, MEX_W], [MEX_N, MEX_E]],
+            opacity=capas.get('sss_opacity', 0.75), name="👥 HeatMap SSS"
         ).add_to(m)
 
-    # Distanc_SNA
     if capas.get('sna_on') and capas.get('sna_data') is not None:
-        data, bounds = capas['sna_data']
-        esq_key = capas.get('sna_esquema','Semaforo')
-        esquema = ESQUEMA_SEMAFORO if esq_key == 'Semaforo' else ESQUEMA_AZULES
-        img = crear_imagen_raster(data, RANGOS_HOSP, esquema['colores'])
+        data, _ = capas['sna_data']
+        esquema = ESQUEMA_SEMAFORO if capas.get('sna_esquema','Semaforo') == 'Semaforo' else ESQUEMA_AZULES
+        img = crear_imagen_raster(data, RANGOS_HOSP, esquema['colores'],
+                                  aplicar_mercator=True, lat_s=MEX_S, lat_n=MEX_N)
         folium.raster_layers.ImageOverlay(
-            image=img, bounds=[[bounds[0],bounds[1]],[bounds[2],bounds[3]]],
-            opacity=capas.get('sna_opacity',0.75), name="🏥 Todos los hospitales"
+            image=img, bounds=[[MEX_S, MEX_W], [MEX_N, MEX_E]],
+            opacity=capas.get('sna_opacity', 0.75), name="🏥 Todos los hospitales"
         ).add_to(m)
 
-    # DA_CAMAS
     if capas.get('camas_on') and capas.get('camas_data') is not None:
-        data, bounds = capas['camas_data']
-        esq_key = capas.get('camas_esquema','Semaforo')
-        esquema = ESQUEMA_SEMAFORO if esq_key == 'Semaforo' else ESQUEMA_AZULES
-        img = crear_imagen_raster(data, RANGOS_HOSP, esquema['colores'])
+        data, _ = capas['camas_data']
+        esquema = ESQUEMA_SEMAFORO if capas.get('camas_esquema','Semaforo') == 'Semaforo' else ESQUEMA_AZULES
+        img = crear_imagen_raster(data, RANGOS_HOSP, esquema['colores'],
+                                  aplicar_mercator=True, lat_s=MEX_S, lat_n=MEX_N)
         folium.raster_layers.ImageOverlay(
-            image=img, bounds=[[bounds[0],bounds[1]],[bounds[2],bounds[3]]],
-            opacity=capas.get('camas_opacity',0.75), name="🛏️ H. no especializados"
+            image=img, bounds=[[MEX_S, MEX_W], [MEX_N, MEX_E]],
+            opacity=capas.get('camas_opacity', 0.75), name="🛏️ H. no especializados"
         ).add_to(m)
 
-    # Estados
-    if capas.get('estados_on'):
-        entidad, edos_nofed, _ = cargar_capas_poligonos()
-        nofed_set = set(edos_nofed['NOMGEO'].tolist())
-        capa_est = folium.FeatureGroup(name="🗺️ Estados", show=True)
-        for _, row in entidad.iterrows():
-            es_nofed = row['NOMGEO'] in nofed_set
+    # ── EDOS_NOFED — encima de rasters, tapa estados sin cobertura ────────────
+    try:
+        _, edos_nofed, _ = cargar_capas_poligonos()
+        capa_nofed = folium.FeatureGroup(name="🔲 Estados no federalizados", show=True)
+        for _, row in edos_nofed.iterrows():
             folium.GeoJson(
                 row['geometry'].__geo_interface__,
-                style_function=lambda f, c='#c0392b' if es_nofed else '#2980b9',
-                    op=0.25 if es_nofed else 0.10: {
-                        'fillColor':c,'color':'#555','weight':1,'fillOpacity':op},
-                tooltip=row['NOMGEO']
-            ).add_to(capa_est)
+                style_function=lambda f: {
+                    'fillColor': '#6b7280',
+                    'color':     '#4b5563',
+                    'weight':    1,
+                    'fillOpacity': 0.92,
+                },
+                tooltip=row.get('NOMGEO', '')
+            ).add_to(capa_nofed)
+        capa_nofed.add_to(m)
+    except Exception:
+        pass
+
+    # ── Estados federalizados (contornos) ─────────────────────────────────────
+    if capas.get('estados_on'):
+        entidad, edos_nofed, _ = cargar_capas_poligonos()
+        nofed_claves = set(edos_nofed['CVE_ENT'].astype(str).tolist())
+        capa_est = folium.FeatureGroup(name="🗺️ Estados", show=True)
+        for _, row in entidad.iterrows():
+            es_nofed = str(row.get('CVE_ENT','')).zfill(2) in nofed_claves
+            if not es_nofed:   # solo dibujar contorno de estados federalizados
+                folium.GeoJson(
+                    row['geometry'].__geo_interface__,
+                    style_function=lambda f: {
+                        'fillColor': 'transparent',
+                        'color': '#4a6fa5',
+                        'weight': 1.2,
+                        'fillOpacity': 0,
+                    },
+                    tooltip=row['NOMGEO']
+                ).add_to(capa_est)
         capa_est.add_to(m)
 
-    # Regiones Operativas
+    # ── Regiones Operativas ───────────────────────────────────────────────────
     if capas.get('ro_on'):
         _, _, ro = cargar_capas_poligonos()
         capa_ro = folium.FeatureGroup(name="🔶 Regiones Operativas", show=True)
@@ -402,7 +505,7 @@ def construir_mapa(capas):
             ).add_to(capa_ro)
         capa_ro.add_to(m)
 
-    # Municipios
+    # ── Municipios ────────────────────────────────────────────────────────────
     estado_mun = capas.get('estado_mun')
     if estado_mun and estado_mun != '(ninguno)':
         try:
@@ -415,20 +518,18 @@ def construir_mapa(capas):
                 gdf_fil = gdf_mun[gdf_mun['CVE_ENT']==cve]
                 capa_mun = folium.FeatureGroup(name=f"🏘️ Municipios — {estado_mun}", show=True)
                 for _, row in gdf_fil.iterrows():
-                    if var == 'gm':
-                        color = COLORES_GM.get(str(row.get('gm','ND')).strip(),'#aaaaaa')
-                    else:
-                        color = '#e74c3c' if str(row.get('PJS','')).strip()=='PJS' else '#3498db'
+                    color = COLORES_GM.get(str(row.get('gm','ND')).strip(),'#aaaaaa') if var == 'gm' \
+                            else ('#e74c3c' if str(row.get('PJS','')).strip()=='PJS' else '#3498db')
                     folium.GeoJson(
                         row['geometry'].__geo_interface__,
                         style_function=lambda f, c=color: {'fillColor':c,'color':'#333','weight':0.6,'fillOpacity':0.55},
                         tooltip=f"{row.get('municip', row.get('NOMGEO',''))} | {row.get('gm','')}"
                     ).add_to(capa_mun)
                 capa_mun.add_to(m)
-        except Exception as e:
+        except Exception:
             pass
 
-    # PNA
+    # ── PNA ───────────────────────────────────────────────────────────────────
     if capas.get('pna_on'):
         gdf_pna = cargar_pna()
         filtro_ent = capas.get('filtro_ent', [])
@@ -436,11 +537,8 @@ def construir_mapa(capas):
         gdf_fil = gdf_pna.copy()
         if filtro_ent: gdf_fil = gdf_fil[gdf_fil['entidad'].isin(filtro_ent)]
         if filtro_cat: gdf_fil = gdf_fil[gdf_fil['categoria_gerencial'].isin(filtro_cat)]
-        usar_cluster = capas.get('cluster', True)
-        if usar_cluster:
-            capa = MarkerCluster(name="📍 Unidades PNA")
-        else:
-            capa = folium.FeatureGroup(name="📍 Unidades PNA", show=True)
+        capa = MarkerCluster(name="📍 Unidades PNA") if capas.get('cluster', True) \
+               else folium.FeatureGroup(name="📍 Unidades PNA", show=True)
         capa.add_to(m)
         for _, row in gdf_fil.iterrows():
             cfg = COLORES_CAT.get(row['categoria_gerencial'], {"color":"#95a5a6","radio":4})
@@ -618,22 +716,44 @@ def make_legend_dots(items):
 sidebar = html.Div([
     html.H5("🏥 Panel de Control", style={"color":"#fff","marginBottom":"20px","fontWeight":"700"}),
 
-    # Isocronas
+    # ── Unidades médicas (puntos) ─────────────────────────────────────────────
     html.Div([
-        html.P("⏱️ Isocronas de accesibilidad", style={"color":"#aaa","fontWeight":"600","fontSize":"13px","marginBottom":"6px"}),
-        dbc.Switch(id="iso-toggle", label="Mostrar", value=True, style={"color":"#ccc"}),
-        html.Div([
-            html.Label("Opacidad", style={"color":"#aaa","fontSize":"11px"}),
-            dcc.Slider(id="iso-opacity", min=0.1, max=1.0, step=0.1, value=0.8,
-                       marks={0.1:"0.1",1.0:"1"}, tooltip={"always_visible":False}),
-            html.Label("Esquema", style={"color":"#aaa","fontSize":"11px","marginTop":"6px"}),
-            dcc.Dropdown(id="iso-esquema", options=list(ESQUEMAS_ISOCRONA.keys()),
-                         value="Azules", clearable=False,
-                         style={"backgroundColor":"#1e1e2e","color":"#fff","fontSize":"12px"}),
-        ], id="iso-controls"),
+        html.P("📍 Unidades médicas", style={"color":"#7eb8f7","fontWeight":"700","fontSize":"13px","marginBottom":"8px","letterSpacing":"0.5px"}),
+        dbc.Switch(id="pna-toggle", label="Centros de salud (CS)", value=True, style={"color":"#ccc"}),
+        dbc.Switch(id="sna-toggle", label="Hospitales totales (H1)", value=False, style={"color":"#ccc"}),
+        dbc.Switch(id="camas-toggle", label="H. sin monotemáticos (H2)", value=False, style={"color":"#ccc"}),
+        dbc.Switch(id="cluster-toggle", label="Agrupar (cluster)", value=True, style={"color":"#ccc","marginTop":"4px"}),
+        html.Label("Filtrar por estado", style={"color":"#aaa","fontSize":"11px","marginTop":"8px"}),
+        dcc.Dropdown(id="filtro-ent", options=sorted(gdf_pna_global['entidad'].unique()),
+                     multi=True, placeholder="Todos...",
+                     style={"backgroundColor":"#1e1e2e","color":"#fff","fontSize":"12px"}),
     ], style={"borderBottom":"1px solid #2a2a3a","paddingBottom":"14px","marginBottom":"14px"}),
 
-    # SSS HeatMap
+    # ── Isócronas (rasters, radio — solo una a la vez) ────────────────────────
+    html.Div([
+        html.P("⏱️ Isócronas", style={"color":"#7eb8f7","fontWeight":"700","fontSize":"13px","marginBottom":"8px","letterSpacing":"0.5px"}),
+        dcc.RadioItems(
+            id="iso-selector",
+            options=[
+                {"label": " Acceso CS",  "value": "cs"},
+                {"label": " Acceso H1",  "value": "h1"},
+                {"label": " Acceso H2",  "value": "h2"},
+                {"label": " Ninguna",    "value": "none"},
+            ],
+            value="cs",
+            labelStyle={"display":"block","color":"#ccc","fontSize":"12px","marginBottom":"4px","cursor":"pointer"},
+            inputStyle={"marginRight":"8px","accentColor":"#7eb8f7"},
+        ),
+        html.Label("Opacidad", style={"color":"#aaa","fontSize":"11px","marginTop":"8px"}),
+        dcc.Slider(id="iso-opacity", min=0.1, max=1.0, step=0.1, value=0.8,
+                   marks={0.1:"0.1",1.0:"1"}, tooltip={"always_visible":False}),
+        html.Label("Esquema", style={"color":"#aaa","fontSize":"11px","marginTop":"6px"}),
+        dcc.Dropdown(id="iso-esquema", options=list(ESQUEMAS_ISOCRONA.keys()),
+                     value="Azules", clearable=False,
+                     style={"backgroundColor":"#1e1e2e","color":"#fff","fontSize":"12px"}),
+    ], style={"borderBottom":"1px solid #2a2a3a","paddingBottom":"14px","marginBottom":"14px"}),
+
+    # ── Población SSS HeatMap ─────────────────────────────────────────────────
     html.Div([
         html.P("👥 Población SSS (HeatMap)", style={"color":"#aaa","fontWeight":"600","fontSize":"13px","marginBottom":"6px"}),
         dbc.Switch(id="sss-toggle", label="Mostrar", value=False, style={"color":"#ccc"}),
@@ -648,35 +768,7 @@ sidebar = html.Div([
         ], id="sss-controls"),
     ], style={"borderBottom":"1px solid #2a2a3a","paddingBottom":"14px","marginBottom":"14px"}),
 
-    # Distanc SNA
-    html.Div([
-        html.P("🏥 Todos los hospitales (SNA)", style={"color":"#aaa","fontWeight":"600","fontSize":"13px","marginBottom":"6px"}),
-        dbc.Switch(id="sna-toggle", label="Mostrar", value=False, style={"color":"#ccc"}),
-        html.Div([
-            html.Label("Opacidad", style={"color":"#aaa","fontSize":"11px"}),
-            dcc.Slider(id="sna-opacity", min=0.1, max=1.0, step=0.1, value=0.75,
-                       marks={0.1:"0.1",1.0:"1"}, tooltip={"always_visible":False}),
-            dcc.Dropdown(id="sna-esquema", options=["Semaforo","Azules"],
-                         value="Semaforo", clearable=False,
-                         style={"backgroundColor":"#1e1e2e","color":"#fff","fontSize":"12px"}),
-        ], id="sna-controls"),
-    ], style={"borderBottom":"1px solid #2a2a3a","paddingBottom":"14px","marginBottom":"14px"}),
-
-    # DA CAMAS
-    html.Div([
-        html.P("🛏️ H. no especializados (Camas)", style={"color":"#aaa","fontWeight":"600","fontSize":"13px","marginBottom":"6px"}),
-        dbc.Switch(id="camas-toggle", label="Mostrar", value=False, style={"color":"#ccc"}),
-        html.Div([
-            html.Label("Opacidad", style={"color":"#aaa","fontSize":"11px"}),
-            dcc.Slider(id="camas-opacity", min=0.1, max=1.0, step=0.1, value=0.75,
-                       marks={0.1:"0.1",1.0:"1"}, tooltip={"always_visible":False}),
-            dcc.Dropdown(id="camas-esquema", options=["Semaforo","Azules"],
-                         value="Semaforo", clearable=False,
-                         style={"backgroundColor":"#1e1e2e","color":"#fff","fontSize":"12px"}),
-        ], id="camas-controls"),
-    ], style={"borderBottom":"1px solid #2a2a3a","paddingBottom":"14px","marginBottom":"14px"}),
-
-    # Polígonos
+    # ── Capas poligonales ─────────────────────────────────────────────────────
     html.Div([
         html.P("🗂️ Capas poligonales", style={"color":"#aaa","fontWeight":"600","fontSize":"13px","marginBottom":"6px"}),
         dbc.Switch(id="estados-toggle", label="Límites de estados", value=True, style={"color":"#ccc"}),
@@ -695,22 +787,7 @@ sidebar = html.Div([
         ], id="var-mun-div"),
     ], style={"borderBottom":"1px solid #2a2a3a","paddingBottom":"14px","marginBottom":"14px"}),
 
-    # PNA
-    html.Div([
-        html.P("📍 Unidades PNA", style={"color":"#aaa","fontWeight":"600","fontSize":"13px","marginBottom":"6px"}),
-        dbc.Switch(id="pna-toggle", label="Mostrar unidades", value=True, style={"color":"#ccc"}),
-        dbc.Switch(id="cluster-toggle", label="Agrupar (cluster)", value=True, style={"color":"#ccc"}),
-        html.Label("Filtrar por estado", style={"color":"#aaa","fontSize":"11px","marginTop":"6px"}),
-        dcc.Dropdown(id="filtro-ent", options=sorted(gdf_pna_global['entidad'].unique()),
-                     multi=True, placeholder="Todos...",
-                     style={"backgroundColor":"#1e1e2e","color":"#fff","fontSize":"12px"}),
-        html.Label("Categoría", style={"color":"#aaa","fontSize":"11px","marginTop":"6px"}),
-        dcc.Dropdown(id="filtro-cat", options=cats_lista, value=cats_lista,
-                     multi=True,
-                     style={"backgroundColor":"#1e1e2e","color":"#fff","fontSize":"12px"}),
-    ], style={"borderBottom":"1px solid #2a2a3a","paddingBottom":"14px","marginBottom":"14px"}),
-
-    # Mapa base
+    # ── Mapa base ─────────────────────────────────────────────────────────────
     html.Div([
         html.P("🗺️ Mapa base", style={"color":"#aaa","fontWeight":"600","fontSize":"13px","marginBottom":"6px"}),
         dcc.Dropdown(id="basemap",
@@ -719,45 +796,62 @@ sidebar = html.Div([
                      style={"backgroundColor":"#1e1e2e","color":"#fff","fontSize":"12px"}),
     ]),
 
+    # Stores necesarios (sin UI)
+    dcc.Store(id="iso-toggle", data=True),
+    dcc.Store(id="sna-esquema", data="Semaforo"),
+    dcc.Store(id="camas-esquema", data="Semaforo"),
+
 ], style=SIDEBAR_STYLE)
 
 content = html.Div([
 
     # Header
     html.Div([
-        html.H2("Isocronas de Accesibilidad a Centros de Salud",
-                style={"color":"#e8eaf6","fontFamily":"Syne, sans-serif","fontWeight":"800",
-                       "fontSize":"24px","margin":"0","letterSpacing":"-0.5px"}),
-        html.P("Tiempo de viaje al centro de salud más cercano · Unidades IMSS-Bienestar",
-               style={"color":"#6b7a99","fontSize":"13px","margin":"4px 0 0 0","fontFamily":"DM Mono, monospace"}),
-    ], style={"marginBottom":"20px","paddingBottom":"16px","borderBottom":"1px solid #1e2438"}),
+        html.Div([
+            html.H2("Accesibilidad geográfica a unidades médicas",
+                    style={"color":"#e8eaf6","fontFamily":"Syne, sans-serif","fontWeight":"800",
+                           "fontSize":"24px","margin":"0","letterSpacing":"-0.5px"}),
+            html.P("Detección de desiertos de atención · IMSS-Bienestar · Fuente: Isocronas AC_PN_NUMM + AGEBs",
+                   style={"color":"#6b7a99","fontSize":"12px","margin":"4px 0 0 0","fontFamily":"DM Mono, monospace"}),
+        ]),
+    ], style={"marginBottom":"16px","paddingBottom":"16px","borderBottom":"1px solid #1e2438"}),
 
-    # Métricas
+    # Métricas — reactivas al raster activo y al filtro de estado
     dbc.Row([
         dbc.Col(html.Div([
-            html.P("⏱️ Tiempo promedio", style={"color":"#6b7a99","fontSize":"11px","margin":"0","fontFamily":"DM Mono"}),
+            html.P(id="label-media", children="⏱️ Tiempo promedio",
+                   style={"color":"#6b7a99","fontSize":"11px","margin":"0","fontFamily":"DM Mono"}),
             html.H4(id="metric-media", style={"color":"#e8eaf6","margin":"4px 0 0 0","fontFamily":"Syne"}),
+            html.P(id="label-scope", children="territorio nacional",
+                   style={"color":"#3d4f6e","fontSize":"10px","margin":"2px 0 0 0","fontFamily":"DM Mono"}),
         ], className="metric-card"), width=2),
         dbc.Col(html.Div([
-            html.P("⏱️ Tiempo mediano", style={"color":"#6b7a99","fontSize":"11px","margin":"0","fontFamily":"DM Mono"}),
+            html.P("📍 Mediana de acceso", style={"color":"#6b7a99","fontSize":"11px","margin":"0","fontFamily":"DM Mono"}),
             html.H4(id="metric-mediana", style={"color":"#e8eaf6","margin":"4px 0 0 0","fontFamily":"Syne"}),
+            html.P("50% de la población", style={"color":"#3d4f6e","fontSize":"10px","margin":"2px 0 0 0","fontFamily":"DM Mono"}),
         ], className="metric-card"), width=2),
         dbc.Col(html.Div([
-            html.P("🟢 Acceso < 30 min", style={"color":"#6b7a99","fontSize":"11px","margin":"0","fontFamily":"DM Mono"}),
+            html.P("🟢 Buena accesibilidad", style={"color":"#6b7a99","fontSize":"11px","margin":"0","fontFamily":"DM Mono"}),
             html.H4(id="metric-30", style={"color":"#2ecc71","margin":"4px 0 0 0","fontFamily":"Syne"}),
+            html.P("llegan en < 30 min", style={"color":"#3d4f6e","fontSize":"10px","margin":"2px 0 0 0","fontFamily":"DM Mono"}),
         ], className="metric-card"), width=2),
         dbc.Col(html.Div([
-            html.P("🟡 Acceso < 1 hora", style={"color":"#6b7a99","fontSize":"11px","margin":"0","fontFamily":"DM Mono"}),
+            html.P("🟡 Acceso aceptable", style={"color":"#6b7a99","fontSize":"11px","margin":"0","fontFamily":"DM Mono"}),
             html.H4(id="metric-60", style={"color":"#f39c12","margin":"4px 0 0 0","fontFamily":"Syne"}),
+            html.P("llegan en < 1 hora", style={"color":"#3d4f6e","fontSize":"10px","margin":"2px 0 0 0","fontFamily":"DM Mono"}),
         ], className="metric-card"), width=2),
         dbc.Col(html.Div([
-            html.P("📍 Unidades PNA", style={"color":"#6b7a99","fontSize":"11px","margin":"0","fontFamily":"DM Mono"}),
-            html.H4(id="metric-pna", style={"color":"#7eb8f7","margin":"4px 0 0 0","fontFamily":"Syne"}),
+            html.P(id="label-pna", children="📍 Unidades médicas activas",
+                   style={"color":"#6b7a99","fontSize":"11px","margin":"0","fontFamily":"DM Mono"}),
+            html.H4(id="metric-pna", style={"color":"#7eb8f7","margin":"4px 0 2px 0","fontFamily":"Syne"}),
+            html.Div(id="metric-pna-detalle",
+                     style={"color":"#4a6080","fontSize":"10px","fontFamily":"DM Mono","lineHeight":"1.5"}),
         ], className="metric-card"), width=2),
         dbc.Col(html.Div([
-            html.P("🔴 Acceso > 2 hrs", style={"color":"#6b7a99","fontSize":"11px","margin":"0","fontFamily":"DM Mono"}),
+            html.P("🔴 Desierto de atención", style={"color":"#6b7a99","fontSize":"11px","margin":"0","fontFamily":"DM Mono"}),
             html.H4(id="metric-120", style={"color":"#e74c3c","margin":"4px 0 0 0","fontFamily":"Syne"}),
-        ], className="metric-card"), width=2),
+            html.P("requieren > 2 horas", style={"color":"#3d4f6e","fontSize":"10px","margin":"2px 0 0 0","fontFamily":"DM Mono"}),
+        ], className="metric-card", style={"borderColor":"rgba(231,76,60,0.3)"}), width=2),
     ], className="mb-3 g-2"),
 
     # Mapa
@@ -774,36 +868,17 @@ content = html.Div([
     # ---- ANÁLISIS ----
     html.Div([
         html.Hr(style={"borderColor":"#1e2438","margin":"28px 0 20px 0"}),
-        html.H5("📊 Análisis de distribución", style={
-            "color":"#e8eaf6","fontFamily":"Syne, sans-serif","fontWeight":"700",
-            "fontSize":"16px","marginBottom":"16px"
-        }),
 
         dbc.Row([
-            # Gráfica de barras
             dbc.Col([
-                html.P("Distribución por rango de tiempo", style={"color":"#6b7a99","fontSize":"12px","marginBottom":"8px","fontFamily":"DM Mono"}),
-                html.Div(id="tabla-dist"),
-            ], width=7),
-
-            # Tabla detalle
+                html.H5("📊 Análisis de accesibilidad", style={
+                    "color":"#e8eaf6","fontFamily":"Syne, sans-serif","fontWeight":"700",
+                    "fontSize":"16px","marginBottom":"0","display":"inline-block"
+                }),
+            ], width=6, style={"display":"flex","alignItems":"center"}),
             dbc.Col([
-                html.P("Detalle numérico", style={"color":"#6b7a99","fontSize":"12px","marginBottom":"8px","fontFamily":"DM Mono"}),
-                html.Div(id="tabla-detalle"),
-            ], width=5),
-        ], className="mb-4"),
-
-        # Tablitas de población por categoría
-        html.Hr(style={"borderColor":"#1e2438","margin":"8px 0 20px 0"}),
-        html.H5("👥 Población por categoría de acceso", style={
-            "color":"#e8eaf6","fontFamily":"Syne, sans-serif","fontWeight":"700",
-            "fontSize":"16px","marginBottom":"4px"
-        }),
-        html.P("Totales de población según tiempo de viaje al centro de salud más cercano — fuente: AGEBs",
-               style={"color":"#6b7a99","fontSize":"12px","fontFamily":"DM Mono","marginBottom":"12px"}),
-        dbc.Row([
-            dbc.Col([
-                html.Label("Filtrar por estado:", style={"color":"#9ba8c0","fontSize":"11px","fontFamily":"DM Mono","marginBottom":"4px"}),
+                html.Label("Filtrar por estado:", style={"color":"#9ba8c0","fontSize":"11px",
+                           "fontFamily":"DM Mono","marginBottom":"4px","display":"block"}),
                 dcc.Dropdown(
                     id="filtro-estado-tablas",
                     options=[{"label": e, "value": e} for e in sorted(estados_lista[1:])],
@@ -814,29 +889,33 @@ content = html.Div([
                     style={"fontSize":"12px"},
                 ),
             ], width=6),
-        ], className="mb-3"),
-        dbc.Row([
-            dbc.Col(html.Div(id="tabla-pob-pna"),   width=4),
-            dbc.Col(html.Div(id="tabla-pob-camas"),  width=4),
-            dbc.Col(html.Div(id="tabla-pob-sna"),    width=4),
-        ], className="mb-4 g-3"),
+        ], className="mb-4", style={"alignItems":"center"}),
+
+        # Panel 1 — Banner cobertura
+        html.Div(id="banner-desierto", className="mb-4"),
+
+        # Panel 2 — Tabla población por categorías (una sola, reactiva a isocrona)
+        html.Div(id="tabla-pob-pna", className="mb-4"),
+
+        # Panel 3 — Población SIN acceso por grado de marginación
+        html.Div(id="tabla-pob-sna", className="mb-4"),
 
         # Insight cards
-        html.Hr(style={"borderColor":"#1e2438","margin":"8px 0 20px 0"}),
-        html.H5("💡 Hallazgos principales", style={
-            "color":"#e8eaf6","fontFamily":"Syne, sans-serif","fontWeight":"700",
-            "fontSize":"16px","marginBottom":"16px"
-        }),
         dbc.Row([
             dbc.Col(html.Div(id="insight-verde"), width=4),
             dbc.Col(html.Div(id="insight-ambar"), width=4),
             dbc.Col(html.Div(id="insight-rojo"),  width=4),
         ], className="mb-4"),
 
+        # Elementos ocultos para mantener compatibilidad con outputs del callback
+        html.Div(id="tabla-dist",    style={"display":"none"}),
+        html.Div(id="tabla-detalle", style={"display":"none"}),
+        html.Div(id="tabla-pob-camas", style={"display":"none"}),
+
     ], id="seccion-analisis"),
 
     html.Hr(style={"borderColor":"#1e2438","margin":"16px 0"}),
-    html.P("🏥 Dashboard de Accesibilidad · IMSS-Bienestar · AC_PN_NUMM · HeatMap SSS · PNA",
+    html.P("🏥 Dashboard de Accesibilidad · IMSS-Bienestar · AC_PN_NUMM · PNA IMSS-Bienestar",
            style={"color":"#2d3555","fontSize":"11px","textAlign":"center","fontFamily":"DM Mono"}),
 
 ], style=CONTENT_STYLE)
@@ -864,57 +943,76 @@ app.layout = html.Div([sidebar, content], style={"backgroundColor":"#0f1117","mi
     Output("tabla-pob-pna",    "children"),
     Output("tabla-pob-camas",  "children"),
     Output("tabla-pob-sna",    "children"),
-    Input("iso-toggle",     "value"),
-    Input("iso-opacity",    "value"),
-    Input("iso-esquema",    "value"),
-    Input("sss-toggle",     "value"),
-    Input("sss-opacity",    "value"),
-    Input("sss-esquema",    "value"),
-    Input("sna-toggle",     "value"),
-    Input("sna-opacity",    "value"),
-    Input("sna-esquema",    "value"),
-    Input("camas-toggle",   "value"),
-    Input("camas-opacity",  "value"),
-    Input("camas-esquema",  "value"),
-    Input("estados-toggle", "value"),
-    Input("ro-toggle",      "value"),
-    Input("estado-mun",     "value"),
-    Input("var-mun",        "value"),
-    Input("pna-toggle",     "value"),
-    Input("cluster-toggle", "value"),
-    Input("filtro-ent",     "value"),
-    Input("filtro-cat",     "value"),
-    Input("basemap",        "value"),
+    Output("banner-desierto",  "children"),
+    Output("label-scope",      "children"),
+    Output("metric-pna-detalle", "children"),
+    Input("iso-selector",    "value"),
+    Input("iso-opacity",     "value"),
+    Input("iso-esquema",     "value"),
+    Input("sss-toggle",      "value"),
+    Input("sss-opacity",     "value"),
+    Input("sss-esquema",     "value"),
+    Input("sna-esquema",     "data"),
+    Input("camas-esquema",   "data"),
+    Input("estados-toggle",  "value"),
+    Input("ro-toggle",       "value"),
+    Input("estado-mun",      "value"),
+    Input("var-mun",         "value"),
+    Input("pna-toggle",      "value"),
+    Input("cluster-toggle",  "value"),
+    Input("filtro-ent",      "value"),
+    Input("basemap",         "value"),
     Input("filtro-estado-tablas", "value"),
 )
 def actualizar_mapa(
-    iso_on, iso_op, iso_esq,
+    iso_sel, iso_op, iso_esq,
     sss_on, sss_op, sss_esq,
-    sna_on, sna_op, sna_esq,
-    camas_on, camas_op, camas_esq,
+    sna_esq, camas_esq,
     estados_on, ro_on, estado_mun, var_mun,
-    pna_on, cluster, filtro_ent, filtro_cat,
+    pna_on, cluster, filtro_ent,
     basemap, filtro_estado_tablas
 ):
     status = ""
+
+    # Derivar toggles desde iso-selector
+    iso_on    = iso_sel == "cs"
+    iso_h1_on = iso_sel == "h1"
+    iso_h2_on = iso_sel == "h2"
+
+    # Umbral según isocrona activa
+    umbral_min = 30 if iso_sel == "cs" else 60
+
+    # Columna AGEBs según isocrona
+    col_cat = {"cs": "cat_PNA", "h1": "cat_sna", "h2": "cat_camas"}.get(iso_sel, "cat_PNA")
+
+    filtro_cat = []  # ya no se usa filtro de categoría en el sidebar
+
     capas = {
         'basemap': basemap,
         'iso_on': iso_on, 'iso_opacity': iso_op, 'iso_esquema': iso_esq, 'iso_data': None,
         'sss_on': sss_on, 'sss_opacity': sss_op, 'sss_esquema': sss_esq, 'sss_data': None,
-        'sna_on': sna_on, 'sna_opacity': sna_op, 'sna_esquema': sna_esq, 'sna_data': None,
-        'camas_on': camas_on, 'camas_opacity': camas_op, 'camas_esquema': camas_esq, 'camas_data': None,
+        'sna_on': iso_h1_on, 'sna_opacity': iso_op, 'sna_esquema': sna_esq, 'sna_data': None,
+        'camas_on': iso_h2_on, 'camas_opacity': iso_op, 'camas_esquema': camas_esq, 'camas_data': None,
         'estados_on': estados_on, 'ro_on': ro_on,
         'estado_mun': estado_mun, 'var_mun': var_mun,
         'pna_on': pna_on, 'cluster': cluster,
-        'filtro_ent': filtro_ent or [], 'filtro_cat': filtro_cat or [],
+        'filtro_ent': filtro_ent or [], 'filtro_cat': filtro_cat,
     }
 
     stats = {'media':0,'mediana':0,'pct_30':0,'pct_60':0,'pct_120':0,'distribucion':[]}
 
     try:
-        if iso_on:
+        if iso_sel == "cs":
             data, bounds = cargar_raster_isocrona()
             capas['iso_data'] = (data, bounds)
+            stats = calcular_estadisticas(data)
+        elif iso_sel == "h1":
+            data, bounds = cargar_raster_hospital("Distanc_SNA.tif")
+            capas['sna_data'] = (data, bounds)
+            stats = calcular_estadisticas(data)
+        elif iso_sel == "h2":
+            data, bounds = cargar_raster_hospital("DA_CAMAS.tif")
+            capas['camas_data'] = (data, bounds)
             stats = calcular_estadisticas(data)
     except Exception as e:
         status += f"⚠️ Isocrona: {e} "
@@ -925,143 +1023,271 @@ def actualizar_mapa(
     except Exception as e:
         status += f"⚠️ SSS: {e} "
 
-    try:
-        if sna_on:
-            capas['sna_data'] = cargar_raster_hospital("Distanc_SNA.tif")
-    except Exception as e:
-        status += f"⚠️ SNA: {e} "
-
-    try:
-        if camas_on:
-            capas['camas_data'] = cargar_raster_hospital("DA_CAMAS.tif")
-    except Exception as e:
-        status += f"⚠️ Camas: {e} "
-
     mapa_html = construir_mapa(capas)
 
     # Contar PNA filtrado
     gdf_p = cargar_pna()
     if filtro_ent: gdf_p = gdf_p[gdf_p['entidad'].isin(filtro_ent)]
-    if filtro_cat: gdf_p = gdf_p[gdf_p['categoria_gerencial'].isin(filtro_cat)]
     n_pna = len(gdf_p) if pna_on else 0
 
-    # ---- Componentes de análisis ----
-    COLORES_RANGOS = ['#2ecc71','#f39c12','#e67e22','#e74c3c','#7b0c0c']
-    EMOJIS         = ['🟢','🟡','🟠','🔴','⚫']
+    # ── Desglose de unidades según capa activa ────────────────────────────────
+    # Cargar Excel de categorías (una sola vez, en cache)
+    if 'clues_cats' not in _cache:
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(ruta("CLUES_IMB_Categorías_UAS.xlsx"), read_only=True)
+            ws = wb.active
+            rows = list(ws.iter_rows(min_row=2, values_only=True))
+            _cache['clues_cats'] = rows
+        except Exception:
+            _cache['clues_cats'] = []
 
+    clues_rows = _cache.get('clues_cats', [])
+
+    def contar_cats(nivel_filtro, excluir_cats=None):
+        """Cuenta unidades EN OPERACION por categoria_gerencial."""
+        c = {}
+        for row in clues_rows:
+            if row[10] != 'EN OPERACION': continue
+            if row[11] not in nivel_filtro: continue
+            cat = row[7] or 'Otros'
+            if excluir_cats and cat in excluir_cats: continue
+            c[cat] = c.get(cat, 0) + 1
+        return c
+
+    pna_detalle = ""
+    if pna_on or iso_sel in ("h1", "h2"):
+        if iso_sel == "cs" and pna_on:
+            cats_cs = contar_cats(['PRIMER NIVEL'])
+            nucleos = cats_cs.get('Núcleos', 0)
+            cessa   = cats_cs.get('Servicios ampliados', 0)
+            pna_detalle = f"Núcleos: {nucleos:,} · CESSA: {cessa:,}"
+        elif iso_sel == "h1":
+            cats_h = contar_cats(['SEGUNDO NIVEL', 'TERCER NIVEL'])
+            lineas = [
+                f"HBC: {cats_h.get('Basico comunitario',0):,}",
+                f"HG: {cats_h.get('Generales',0):,}",
+                f"HRAE: {cats_h.get('HRAES',0):,}",
+                f"Mat.Inf: {cats_h.get('Materno infantil',0):,}",
+                f"Psiq: {cats_h.get('Psiquiátrico',0):,}",
+                f"Ped: {cats_h.get('Pediátrico',0):,}",
+            ]
+            pna_detalle = " · ".join(lineas)
+        elif iso_sel == "h2":
+            cats_h = contar_cats(['SEGUNDO NIVEL', 'TERCER NIVEL'],
+                                  excluir_cats={'Psiquiátrico', 'Pediátrico'})
+            lineas = [
+                f"HBC: {cats_h.get('Basico comunitario',0):,}",
+                f"HG: {cats_h.get('Generales',0):,}",
+                f"HRAE: {cats_h.get('HRAES',0):,}",
+                f"Mat.Inf: {cats_h.get('Materno infantil',0):,}",
+            ]
+            pna_detalle = " · ".join(lineas)
+
+    # ---- Scope label para tarjeta de tiempo promedio ----
+    scope_label = f"{', '.join(filtro_estado_tablas)}" if filtro_estado_tablas else "territorio nacional"
+
+    # ---- Distribución raster (barras compactas, sin tabla redundante) ----
+    COLORES_RANGOS = ['#2ecc71','#f39c12','#e67e22','#e74c3c','#7b0c0c']
     dist = stats.get('distribucion', [])
 
-    # Barras de distribución
     if dist:
         max_pct = max(d['Porcentaje'] for d in dist) or 1
         barras = html.Div([
-            html.Div([
+            html.P("Distribución por tiempo de viaje · isocronas raster",
+                   style={"color":"#6b7a99","fontSize":"11px","marginBottom":"10px","fontFamily":"DM Mono"}),
+            *[html.Div([
                 html.Div(d['Emoji'] + " " + d['Rango'],
-                         style={"fontSize":"11px","color":"#9ba8c0","width":"120px",
-                                "flexShrink":"0","fontFamily":"DM Mono"}),
+                         style={"fontSize":"11px","color":"#9ba8c0","width":"110px","flexShrink":"0","fontFamily":"DM Mono"}),
                 html.Div(style={
-                    "height":"18px","borderRadius":"3px","flexGrow":"1",
+                    "height":"16px","borderRadius":"3px","flexGrow":"1",
                     "backgroundColor": COLORES_RANGOS[i],
                     "width": f"{d['Porcentaje']/max_pct*100:.0f}%",
                     "minWidth":"2px","transition":"width 0.4s ease"
                 }),
                 html.Div(f"{d['Porcentaje']:.1f}%",
-                         style={"fontSize":"11px","color":"#9ba8c0","width":"44px",
-                                "textAlign":"right","flexShrink":"0","fontFamily":"DM Mono"}),
-            ], style={"display":"flex","alignItems":"center","gap":"10px","marginBottom":"6px"})
-            for i, d in enumerate(dist)
-        ])
+                         style={"fontSize":"11px","color": COLORES_RANGOS[i],"width":"40px",
+                                "textAlign":"right","flexShrink":"0","fontFamily":"DM Mono","fontWeight":"600"}),
+            ], style={"display":"flex","alignItems":"center","gap":"10px","marginBottom":"5px"})
+            for i, d in enumerate(dist)]
+        ], style={"backgroundColor":"#0f1420","borderRadius":"8px","padding":"14px",
+                  "border":"1px solid #1e2438"})
     else:
         barras = html.P("Activa las isocronas para ver la distribución.",
-                        style={"color":"#555","fontSize":"12px","fontFamily":"DM Mono"})
+                        style={"color":"#3d4f6e","fontSize":"12px","fontFamily":"DM Mono",
+                               "padding":"14px","backgroundColor":"#0f1420","borderRadius":"8px",
+                               "border":"1px dashed #1e2438"})
 
-    # Tabla detalle
-    if dist:
-        tabla = html.Table([
-            html.Thead(html.Tr([
-                html.Th("Rango",     style={"color":"#6b7a99","fontSize":"11px","padding":"4px 8px","fontFamily":"DM Mono","fontWeight":"500"}),
-                html.Th("Píxeles",   style={"color":"#6b7a99","fontSize":"11px","padding":"4px 8px","textAlign":"right","fontFamily":"DM Mono","fontWeight":"500"}),
-                html.Th("%",         style={"color":"#6b7a99","fontSize":"11px","padding":"4px 8px","textAlign":"right","fontFamily":"DM Mono","fontWeight":"500"}),
-            ])),
-            html.Tbody([
-                html.Tr([
-                    html.Td(d['Emoji']+" "+d['Rango'],
-                            style={"fontSize":"11px","color":"#c8d0e7","padding":"4px 8px","fontFamily":"DM Mono"}),
-                    html.Td(f"{d['Pixeles']:,}",
-                            style={"fontSize":"11px","color":"#9ba8c0","padding":"4px 8px","textAlign":"right","fontFamily":"DM Mono"}),
-                    html.Td(f"{d['Porcentaje']:.1f}%",
-                            style={"fontSize":"11px","color": COLORES_RANGOS[i],"padding":"4px 8px","textAlign":"right","fontFamily":"DM Mono","fontWeight":"600"}),
-                ], style={"borderBottom":"1px solid #1e2438"})
-                for i, d in enumerate(dist)
-            ])
-        ], style={"width":"100%","borderCollapse":"collapse"})
-    else:
-        tabla = html.P("—", style={"color":"#555","fontSize":"12px"})
+    tabla_detalle_html = html.Div()
 
-    # Insight cards
+    # ── Configuración según isocrona activa ───────────────────────────────────
+    COL_POB = 'POBLACIÓN NO DERECHOHABIENTE'
+    ISO_CONFIG = {
+        "cs":   {"col": "cat_PNA",   "umbral": 30,  "label": "centros de salud",    "color": "#7eb8f7"},
+        "h1":   {"col": "cat_sna",   "umbral": 60,  "label": "hospitales totales",  "color": "#55efc4"},
+        "h2":   {"col": "cat_camas", "umbral": 60,  "label": "H. sin monotemáticos","color": "#a29bfe"},
+        "none": {"col": "cat_PNA",   "umbral": 30,  "label": "centros de salud",    "color": "#7eb8f7"},
+    }
+    cfg = ISO_CONFIG.get(iso_sel, ISO_CONFIG["cs"])
+    col_cat   = cfg["col"]
+    umbral    = cfg["umbral"]
+    iso_label = cfg["label"]
+    iso_color = cfg["color"]
+
+    pob_desierto = 0
+    pob_total    = 0
+    pob_con_acceso = 0
     pct_buena  = stats['pct_60']
     pct_media  = stats.get('pct_120', 0) - stats['pct_60']
     pct_baja   = 100 - stats.get('pct_120', 0)
+    panel2 = html.Div()
+    panel3 = html.Div()
 
+    try:
+        gdf_ageb = cargar_agebs()
+        gdf_f = gdf_ageb.copy()
+        if filtro_estado_tablas and 'ENTIDAD' in gdf_f.columns:
+            gdf_f = gdf_f[gdf_f['ENTIDAD'].isin(filtro_estado_tablas)]
+
+        estado_label = f" · {', '.join(filtro_estado_tablas)}" if filtro_estado_tablas else ""
+
+        if COL_POB in gdf_f.columns and col_cat in gdf_f.columns:
+            pob_total = int(gdf_f[COL_POB].sum())
+
+            # Categorías con acceso en rango adecuado
+            cat_ok = ['0 a 30 min'] if umbral == 30 else ['0 a 30 min', '30.1 a 60']
+            cat_sin = [c for c in gdf_f[col_cat].unique() if c not in cat_ok and c is not None]
+
+            pob_con_acceso = int(gdf_f.loc[gdf_f[col_cat].isin(cat_ok), COL_POB].sum())
+            pob_desierto   = int(gdf_f.loc[gdf_f[col_cat].isin(cat_sin), COL_POB].sum())
+
+            pct_con_acceso = pob_con_acceso / pob_total * 100 if pob_total else 0
+
+            # ── Panel 2: tabla población por categorías ────────────────────
+            panel2 = tabla_pob_por_categoria(
+                gdf_f, col_cat, COL_POB,
+                f"👥 Población no derechohabiente · {iso_label}{estado_label}",
+                iso_color
+            )
+
+            # ── Panel 3: sin acceso agrupado por Grado de Marginación ──────
+            COL_GM = 'gm' if 'gm' in gdf_f.columns else None
+
+            if COL_GM:
+                gdf_sin = gdf_f[gdf_f[col_cat].isin(cat_sin)].copy()
+                gm_pob = (gdf_sin.groupby(COL_GM)[COL_POB]
+                          .sum().sort_values(ascending=False).reset_index())
+                total_sin = gm_pob[COL_POB].sum()
+
+                GM_COLORS = {
+                    "Muy alto": "#e74c3c", "Alto": "#e67e22",
+                    "Medio": "#f1c40f",    "Bajo": "#2ecc71",
+                    "Muy bajo": "#3498db", "No aplica": "#95a5a6",
+                }
+                filas = []
+                for _, row in gm_pob.iterrows():
+                    gm  = str(row[COL_GM])
+                    pob = int(row[COL_POB])
+                    pct = pob / total_sin * 100 if total_sin else 0
+                    color = GM_COLORS.get(gm, "#7f8c8d")
+                    filas.append(html.Tr([
+                        html.Td([
+                            html.Span(style={"display":"inline-block","width":"10px","height":"10px",
+                                            "borderRadius":"2px","backgroundColor":color,
+                                            "marginRight":"8px","flexShrink":"0"}),
+                            html.Span(gm, style={"color":"#c8d0e7","fontSize":"12px","fontFamily":"DM Mono"}),
+                        ], style={"padding":"6px 10px","display":"flex","alignItems":"center"}),
+                        html.Td(f"{pob:,.0f}",
+                                style={"padding":"6px 10px","color":"#e8eaf6","fontFamily":"DM Mono","fontSize":"12px","textAlign":"right"}),
+                        html.Td(f"{pct:.1f}%",
+                                style={"padding":"6px 10px","color":color,"fontFamily":"DM Mono","fontSize":"12px","textAlign":"right","fontWeight":"600"}),
+                    ]))
+
+                panel3 = html.Div([
+                    html.H6(f"🔴 Sin acceso en rango adecuado · por Grado de Marginación{estado_label}",
+                            style={"color":"#9ba8c0","fontFamily":"Syne","fontSize":"13px",
+                                   "fontWeight":"600","marginBottom":"12px"}),
+                    html.Table(
+                        [html.Thead(html.Tr([
+                            html.Th("Grado de Marginación", style={"padding":"6px 10px","color":"#6b7a99","fontSize":"11px","fontFamily":"DM Mono","textAlign":"left"}),
+                            html.Th("Población",            style={"padding":"6px 10px","color":"#6b7a99","fontSize":"11px","fontFamily":"DM Mono","textAlign":"right"}),
+                            html.Th("%",                    style={"padding":"6px 10px","color":"#6b7a99","fontSize":"11px","fontFamily":"DM Mono","textAlign":"right"}),
+                        ]))] + [html.Tbody(filas)],
+                        style={"width":"100%","borderCollapse":"collapse",
+                               "backgroundColor":"#0f1420","borderRadius":"8px",
+                               "border":"1px solid #1e2438","overflow":"hidden"}
+                    ),
+                ], style={"backgroundColor":"#0f1420","borderRadius":"8px",
+                          "padding":"16px","border":"1px solid rgba(231,76,60,0.2)"})
+            else:
+                panel3 = html.P("Columna de Grado de Marginación no encontrada en AGEBs.",
+                                style={"color":"#6b7a99","fontSize":"11px","fontFamily":"DM Mono"})
+
+            if filtro_estado_tablas:
+                total_v = len(gdf_f)
+                pct_buena = float(gdf_f[col_cat].isin(cat_ok).sum() / total_v * 100) if total_v else 0
+                pct_baja  = float(gdf_f[col_cat].isin(cat_sin).sum() / total_v * 100) if total_v else 0
+                pct_media = 100 - pct_buena - pct_baja
+
+    except FileNotFoundError:
+        panel2 = panel3 = html.P("⚠️ anexo1_desde_excel_tiempos.gpkg no encontrado.",
+                                  style={"color":"#f39c12","fontSize":"11px","fontFamily":"DM Mono"})
+    except Exception as e:
+        panel2 = panel3 = html.P(f"⚠️ Error AGEBs: {e}",
+                                  style={"color":"#e74c3c","fontSize":"11px","fontFamily":"DM Mono"})
+
+    # ── Panel 1: Banner cobertura ─────────────────────────────────────────────
+    pct_con_acceso_val = (pob_con_acceso / pob_total * 100) if pob_total > 0 else 0
+    estado_txt = f" en {', '.join(filtro_estado_tablas)}" if filtro_estado_tablas else " a nivel nacional"
+    rango_txt  = f"0 a {umbral}" if umbral == 30 else f"0 a {umbral}"
+
+    banner = html.Div([
+        html.Div([
+            html.Div([
+                html.P(f"✅ Personas con acceso{estado_txt}",
+                       style={"color":"#2ecc71","fontSize":"12px","fontWeight":"700",
+                              "margin":"0","fontFamily":"Syne"}),
+                html.H2(f"{pob_con_acceso:,.0f}",
+                        style={"color":"#2ecc71","margin":"4px 0","fontFamily":"Syne",
+                               "fontSize":"32px","fontWeight":"800"}),
+                html.P(f"personas con acceso en un rango de {rango_txt} minutos de desplazamiento hacia {iso_label}",
+                       style={"color":"#9ba8c0","fontSize":"12px","margin":"0","fontFamily":"DM Mono"}),
+            ], style={"flex":"1"}),
+            html.Div([
+                html.P(f"{pct_con_acceso_val:.1f}%",
+                       style={"color":"#2ecc71","fontSize":"48px","fontWeight":"800",
+                              "fontFamily":"Syne","margin":"0","lineHeight":"1"}),
+                html.P("de la población no derechohabiente",
+                       style={"color":"#6b7a99","fontSize":"11px","margin":"4px 0 0 0","fontFamily":"DM Mono"}),
+            ], style={"textAlign":"right","flexShrink":"0"}),
+        ], style={"display":"flex","justifyContent":"space-between","alignItems":"center"}),
+    ], style={
+        "backgroundColor":"rgba(46,204,113,0.07)",
+        "border":"1px solid rgba(46,204,113,0.3)",
+        "borderLeft":"4px solid #2ecc71",
+        "borderRadius":"10px","padding":"20px 24px",
+    }) if pob_total > 0 else html.Div()
+
+    # ── Insight cards ─────────────────────────────────────────────────────────
     ins_verde = html.Div([
         html.H6("🟢 Buena accesibilidad", style={"color":"#27ae60","margin":"0 0 6px 0","fontFamily":"Syne","fontSize":"13px"}),
         html.H3(f"{pct_buena:.1f}%", style={"color":"#2ecc71","margin":"0 0 4px 0","fontFamily":"Syne"}),
-        html.P("llega en menos de 1 hora", style={"color":"#9ba8c0","fontSize":"12px","margin":"0","fontFamily":"DM Mono"}),
+        html.P(f"llega en menos de {umbral} min", style={"color":"#9ba8c0","fontSize":"12px","margin":"0","fontFamily":"DM Mono"}),
     ], className="insight-verde")
 
     ins_ambar = html.Div([
         html.H6("🟡 Accesibilidad media", style={"color":"#d68910","margin":"0 0 6px 0","fontFamily":"Syne","fontSize":"13px"}),
         html.H3(f"{pct_media:.1f}%", style={"color":"#f39c12","margin":"0 0 4px 0","fontFamily":"Syne"}),
-        html.P("requiere entre 1 y 2 horas", style={"color":"#9ba8c0","fontSize":"12px","margin":"0","fontFamily":"DM Mono"}),
+        html.P("acceso en rango intermedio", style={"color":"#9ba8c0","fontSize":"12px","margin":"0","fontFamily":"DM Mono"}),
     ], className="insight-ambar")
 
     ins_rojo = html.Div([
-        html.H6("🔴 Baja accesibilidad", style={"color":"#c0392b","margin":"0 0 6px 0","fontFamily":"Syne","fontSize":"13px"}),
+        html.H6("🔴 Sin acceso adecuado", style={"color":"#c0392b","margin":"0 0 6px 0","fontFamily":"Syne","fontSize":"13px"}),
         html.H3(f"{pct_baja:.1f}%", style={"color":"#e74c3c","margin":"0 0 4px 0","fontFamily":"Syne"}),
-        html.P("necesita más de 2 horas", style={"color":"#9ba8c0","fontSize":"12px","margin":"0","fontFamily":"DM Mono"}),
+        html.P(f"fuera del rango de {umbral} min", style={"color":"#9ba8c0","fontSize":"12px","margin":"0","fontFamily":"DM Mono"}),
     ], className="insight-rojo")
 
-    # ---- Tablitas de población por categoría (AGEBs) ----
-    try:
-        gdf_ageb = cargar_agebs()
-        col_pob_candidates = [c for c in gdf_ageb.columns
-                              if any(k in c.upper() for k in ['POB','TOTAL','HAB'])]
-        col_pob = col_pob_candidates[0] if col_pob_candidates else None
-
-        # Filtrar por estado si se seleccionó
-        gdf_f = gdf_ageb.copy()
-        if filtro_estado_tablas:
-            # Buscar columna de estado/entidad en el ageb
-            col_ent_ageb = next((c for c in gdf_f.columns
-                                 if any(k in c.upper() for k in ['ENTIDAD','NOMGEO','NOM_ENT','ESTADO'])), None)
-            if col_ent_ageb:
-                gdf_f = gdf_f[gdf_f[col_ent_ageb].isin(filtro_estado_tablas)]
-            else:
-                # Intentar por CVE_ENT si hay columna de clave
-                col_cve = next((c for c in gdf_f.columns if 'CVE_ENT' in c.upper()), None)
-                if col_cve:
-                    # Mapear nombre→clave usando gdf_entidad_g
-                    claves = gdf_entidad_g[gdf_entidad_g['NOMGEO'].isin(filtro_estado_tablas)]['CVE_ENT'].tolist() \
-                             if 'CVE_ENT' in gdf_entidad_g.columns else []
-                    if claves:
-                        gdf_f = gdf_f[gdf_f[col_cve].isin(claves)]
-
-        estado_label = f" — {', '.join(filtro_estado_tablas)}" if filtro_estado_tablas else ""
-
-        if col_pob:
-            tab_pna   = tabla_pob_por_categoria(gdf_f, 'cat_PNA',   col_pob, f"📍 PNA · Centros de salud{estado_label}",  "#7eb8f7")
-            tab_camas = tabla_pob_por_categoria(gdf_f, 'cat_camas', col_pob, f"🛏️ H. no especializados{estado_label}",    "#a29bfe")
-            tab_sna   = tabla_pob_por_categoria(gdf_f, 'cat_sna',   col_pob, f"🏥 Todos los hospitales{estado_label}",    "#55efc4")
-        else:
-            msg = html.P("Columna de población no encontrada.", style={"color":"#555","fontSize":"11px"})
-            tab_pna = tab_camas = tab_sna = msg
-    except FileNotFoundError:
-        msg = html.P("⚠️ anexo1_desde_excel_tiempos.gpkg no encontrado en la carpeta del proyecto.",
-                     style={"color":"#f39c12","fontSize":"11px","fontFamily":"DM Mono"})
-        tab_pna = tab_camas = tab_sna = msg
-    except Exception as e:
-        msg = html.P(f"⚠️ Error AGEBs: {e}", style={"color":"#e74c3c","fontSize":"11px","fontFamily":"DM Mono"})
-        tab_pna = tab_camas = tab_sna = msg
+    barras = html.Div()  # ya no se usa
 
     return (
         mapa_html,
@@ -1073,13 +1299,16 @@ def actualizar_mapa(
         f"{pct_baja:.1f}%",
         status,
         barras,
-        tabla,
+        tabla_detalle_html,
         ins_verde,
         ins_ambar,
         ins_rojo,
-        tab_pna,
-        tab_camas,
-        tab_sna,
+        panel2,
+        html.Div(),   # tabla-pob-camas oculta
+        panel3,
+        banner,
+        scope_label,
+        pna_detalle,
     )
 
 

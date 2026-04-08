@@ -1,0 +1,6 @@
+﻿# Metadatos QGIS
+*.aux.xml
+*_fix.tif
+DA_CAMAS.tif
+Distanc_SNA.tif
+debug_alineacion.py
